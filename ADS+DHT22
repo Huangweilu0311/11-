@@ -1,0 +1,178 @@
+#include <Wire.h>
+#include "ADS1X15.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include "DHT.h"
+
+// ---------- ADS1115 ----------
+ADS1115 ADS(0x48);
+
+// ---------- DHT22 ----------
+#define DHTPIN 32       // DHT22 接 GPIO32
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------- WiFi ----------
+const char* ssid     = "LS Lab2";
+const char* password = "gs5g4432";
+
+// ---------- MQTT ----------
+const char* mqtt_broker   = "192.168.1.8";
+const int   mqtt_port     = 1883;
+const char* mqtt_topic_adc    = "esp32/adc";
+const char* mqtt_topic_dht    = "esp32/dht22";
+const char* mqtt_topic_status = "esp32/status";
+const char* mqtt_username = "sam";
+const char* mqtt_password = "123456";
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// ---------- NTP ----------
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 8*3600, 60000); // UTC+8, 每60s更新
+
+// ---------- Sample ----------
+struct Sample {
+  float value;      // mV or °C/%RH
+  uint32_t ts_sec;  // 台灣時間 epoch 秒
+  uint32_t ts_usec; // 微秒部分
+  float sampleRate; // Hz
+};
+
+// ---------- Batch settings ----------
+#define BATCH_SIZE 128
+Sample batchBuffer[BATCH_SIZE];
+int sampleIndex = 0;
+uint32_t batchCount = 0;
+
+#define PAYLOAD_BUFFER_SIZE 8192
+char payload[PAYLOAD_BUFFER_SIZE];
+
+// ---------- MQTT connect ----------
+void connectToMQTT() {
+  while(!mqtt_client.connected()){
+    String clientId = "ESP32-" + String(random(0xffff), HEX);
+    if(mqtt_client.connect(clientId.c_str(), mqtt_username, mqtt_password)){
+      mqtt_client.publish(mqtt_topic_status, "{\"status\":\"ESP32 Online\"}", true);
+      Serial.println("MQTT connected");
+    } else {
+      Serial.print("MQTT connect failed, rc=");
+      Serial.println(mqtt_client.state());
+      delay(5000);
+    }
+  }
+}
+
+// ---------- Send batch ----------
+void sendBatch(Sample* buf, int size, const char* topic){
+  timeClient.update();
+  unsigned long ts_epoch = timeClient.getEpochTime(); // 台灣時間秒數
+
+  int len = 0;
+  for(int i=0;i<size;i++){
+    len += snprintf(payload+len,sizeof(payload)-len,
+                    "%.1f,%u,%u,%.1f%s",
+                    buf[i].value,
+                    buf[i].ts_sec,
+                    buf[i].ts_usec,
+                    buf[i].sampleRate,
+                    (i<size-1)?",":"");
+  }
+  len += snprintf(payload+len,sizeof(payload)-len,";%lu", ts_epoch);
+
+  if(!mqtt_client.connected()) connectToMQTT();
+  mqtt_client.publish(topic, payload);
+  mqtt_client.loop();
+
+  Serial.printf("Sent batch %u, %d samples to %s\n", batchCount++, size, topic);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+
+  // 初始化 ADS1115
+  Wire.begin();
+  ADS.begin();
+  ADS.setGain(16);
+  ADS.setDataRate(7); // 860 SPS
+  ADS.setMode(0);     // continuous
+  ADS.requestADC_Differential_0_1();
+
+  // 初始化 DHT22
+  dht.begin();
+
+  // Wi-Fi 與 MQTT
+  WiFi.begin(ssid,password);
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  mqtt_client.setBufferSize(PAYLOAD_BUFFER_SIZE);
+  connectToMQTT();
+
+  timeClient.begin();
+  timeClient.update();
+}
+
+// ---------- Loop ----------
+void loop() {
+  const uint32_t sampleInterval = 2000; // µs → 500Hz
+  static uint32_t lastMicros = micros();
+
+  uint32_t now = micros();
+  if(now - lastMicros >= sampleInterval){
+    float rate = 0;
+    if(sampleIndex>0) rate = 1000000.0 / (now - lastMicros);
+    lastMicros += sampleInterval;
+
+    // 讀 ADS1115
+    int16_t val = ADS.getValue();
+    float voltage_mV = ADS.toVoltage(val)*1000.0;
+
+    // 台灣時間
+    timeClient.update();
+    unsigned long ts_epoch = timeClient.getEpochTime();
+
+    Sample s;
+    s.value      = voltage_mV;
+    s.ts_sec     = ts_epoch;
+    s.ts_usec    = micros() % 1000000;
+    s.sampleRate = rate;
+    batchBuffer[sampleIndex++] = s;
+
+    if(sampleIndex >= BATCH_SIZE){
+      sendBatch(batchBuffer, BATCH_SIZE, mqtt_topic_adc);
+      sampleIndex = 0;
+    }
+
+    ADS.requestADC_Differential_0_1();
+  }
+
+  // 每隔  讀一次 DHT22
+  static unsigned long lastDHTMillis = 0;
+  if(millis() - lastDHTMillis >= 600000){
+    lastDHTMillis = millis();
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    if(!isnan(h) && !isnan(t)){
+      Sample dhtSample;
+      dhtSample.value = t;  // 這裡可以改成 h 讀濕度
+      dhtSample.ts_sec = timeClient.getEpochTime();
+      dhtSample.ts_usec = micros() % 1000000;
+      dhtSample.sampleRate = 0; // DHT22 不計速率
+      sendBatch(&dhtSample, 1, mqtt_topic_dht);
+
+      Serial.printf("DHT22: Temp=%.1f°C Hum=%.1f%%\n", t, h);
+    }
+  }
+
+  if(!mqtt_client.connected()) connectToMQTT();
+  mqtt_client.loop();
+}
