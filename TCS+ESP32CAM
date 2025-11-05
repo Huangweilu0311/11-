@@ -1,0 +1,196 @@
+#include "esp_camera.h"
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "Base64.h"
+#include "esp_sleep.h"
+
+// ---------- Deep Sleep 設定 ----------
+#define uS_TO_S_FACTOR 1000000ULL  // 微秒轉秒
+#define TIME_TO_SLEEP  10          // 喚醒時間（秒）
+
+RTC_DATA_ATTR int bootCount = 0;
+
+// ---------- ESP32-CAM AI-Thinker 引腳 ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_GPIO_NUM      4
+
+// ---------- TCS34725 ----------
+#define TCS_SDA_PIN 14
+#define TCS_SCL_PIN 15
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_154MS, TCS34725_GAIN_1X);
+
+// ---------- WiFi / MQTT ----------
+const char* ssid = "LS Lab2";
+const char* password = "gs5g4432";
+const char* mqtt_broker = "192.168.1.8";
+const int mqtt_port = 1883;
+const char* mqtt_topic_tcs = "esp32/camera/tcs_data";
+const char* mqtt_topic_info = "esp32/camera/info";
+const char* mqtt_topic_data = "esp32/camera/data";
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// ---------- Camera 初始化 ----------
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 25;
+  config.fb_count = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed!");
+  } else {
+    Serial.println("Camera initialized!");
+  }
+}
+
+// ---------- WiFi & MQTT ----------
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+}
+
+void connectToMQTT() {
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  while (!mqtt_client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    String clientId = "ESP32CAM-" + String(random(0xffff), HEX);
+    if (mqtt_client.connect(clientId.c_str())) {
+      Serial.println("connected!");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt_client.state());
+      Serial.println(" try again in 5s");
+      delay(5000);
+    }
+  }
+}
+
+// ---------- 發送 TCS 數據 ----------
+void sendTCS() {
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+  Serial.printf("TCS R:%d G:%d B:%d C:%d\n", r, g, b, c);
+
+  String tcsData = "{\"R\":" + String(r) + ",\"G\":" + String(g) + 
+                   ",\"B\":" + String(b) + ",\"C\":" + String(c) + "}";
+  mqtt_client.publish(mqtt_topic_tcs, tcsData.c_str());
+}
+
+// ---------- 拍照 & 發送 ----------
+void sendPhoto() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+
+  String imageBase64 = base64::encode(fb->buf, fb->len);
+  String imageId = String(millis());
+
+  // 發送圖片資訊
+  String info = "{\"id\":\"" + imageId + "\",\"size\":" + String(fb->len) + "}";
+  mqtt_client.publish(mqtt_topic_info, info.c_str());
+
+  // 分段發送
+  const int maxChunk = 4000;
+  int totalChunks = (imageBase64.length() + maxChunk - 1) / maxChunk;
+  for (int i = 0; i < totalChunks; i++) {
+    int start = i * maxChunk;
+    int len = min(maxChunk, (int)(imageBase64.length() - start));
+    String chunk = imageBase64.substring(start, start + len);
+    String chunkMsg = "{\"id\":\"" + imageId + "\",\"chunk\":" + String(i) +
+                      ",\"total\":" + String(totalChunks) + ",\"data\":\"" + chunk + "\"}";
+    mqtt_client.publish(mqtt_topic_data, chunkMsg.c_str());
+    delay(50);
+    mqtt_client.loop();
+  }
+
+  esp_camera_fb_return(fb);
+}
+
+// ---------- Deep Sleep ----------
+void goToDeepSleep() {
+  Serial.printf("Going to deep sleep for %d seconds...\n", TIME_TO_SLEEP);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  bootCount++;
+  Serial.printf("Boot count: %d\n", bootCount);
+
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, HIGH);
+
+  Wire.begin(TCS_SDA_PIN, TCS_SCL_PIN);
+  if (!tcs.begin()) Serial.println("TCS34725 not found!");
+  else Serial.println("TCS34725 initialized!");
+
+  setupCamera();
+
+  connectToWiFi();
+  connectToMQTT();
+
+  sendTCS();
+  sendPhoto();
+
+  digitalWrite(LED_GPIO_NUM, LOW);
+
+  goToDeepSleep();
+}
+
+void loop() {
+  // Deep Sleep 後會重新執行 setup()
+}
+
+
+
