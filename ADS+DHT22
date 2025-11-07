@@ -86,8 +86,6 @@ void sendBatch(Sample* buf, int size, const char* topic){
   if(!mqtt_client.connected()) connectToMQTT();
   mqtt_client.publish(topic, payload);
   mqtt_client.loop();
-
-  Serial.printf("Sent batch %u, %d samples to %s\n", batchCount++, size, topic);
 }
 
 // ---------- Setup ----------
@@ -155,23 +153,26 @@ void loop() {
     ADS.requestADC_Differential_0_1();
   }
 
-  // 每隔  讀一次 DHT22
-  static unsigned long lastDHTMillis = 0;
-  if(millis() - lastDHTMillis >= 600000){
-    lastDHTMillis = millis();
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    if(!isnan(h) && !isnan(t)){
-      Sample dhtSample;
-      dhtSample.value = t;  // 這裡可以改成 h 讀濕度
-      dhtSample.ts_sec = timeClient.getEpochTime();
-      dhtSample.ts_usec = micros() % 1000000;
-      dhtSample.sampleRate = 0; // DHT22 不計速率
-      sendBatch(&dhtSample, 1, mqtt_topic_dht);
+// 每隔 讀一次 DHT22 (每 10 秒可調)
+static unsigned long lastDHTMillis = 0;
+if(millis() - lastDHTMillis >= 10000){ // 10000 = 10 秒
+  lastDHTMillis = millis();
 
-      Serial.printf("DHT22: Temp=%.1f°C Hum=%.1f%%\n", t, h);
-    }
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  // 檢查感測資料有效
+  if(!isnan(h) && !isnan(t)){
+
+    char dhtPayload[64];
+    snprintf(dhtPayload, sizeof(dhtPayload),
+             "{\"temp\":%.2f,\"humi\":%.2f}", t, h);
+
+    if(!mqtt_client.connected()) connectToMQTT();
+    mqtt_client.publish(mqtt_topic_dht, dhtPayload, true); // true = retain
   }
+}
+
 
   if(!mqtt_client.connected()) connectToMQTT();
   mqtt_client.loop();
