@@ -1,0 +1,177 @@
+import json
+import threading
+import pymysql
+from datetime import datetime, timedelta
+import paho.mqtt.client as mqtt
+
+
+# ---------- MQTT 設定 ----------
+BROKER = "192.168.1.8"
+PORT = 1883
+TOPIC_ADC = "esp32/adc"
+
+
+# ---------- MySQL 設定 ----------
+DB_HOST = "localhost"
+DB_USER = "mqttuser"
+DB_PASSWORD = "gs5g4432"
+DB_NAME = "adc_db"
+TABLE_NAME = "adc_data"
+
+
+# ---------- 500 筆緩衝 ----------
+data_buffer = []
+BATCH_SIZE = 500
+batch_count = 0
+
+
+# ---------- 轉換時間 ----------
+def ts_to_datetime(ts_sec, ts_usec):
+    ts = ts_sec + ts_usec/1e6
+    dt = datetime.utcfromtimestamp(ts) + timedelta(hours=24)  # 校正
+    return dt
+
+
+# ---------- MySQL 寫入 ----------
+def insert_batch(batch):
+    if not batch:
+        return
+    try:
+        conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+                               database=DB_NAME, charset='utf8mb4')
+        cursor = conn.cursor()
+        sql = f"INSERT INTO {TABLE_NAME} (timestamp, value, dt_ms) VALUES (%s, %s, %s)"
+        values = [(item["timestamp"].strftime("%Y-%m-%d %H:%M:%S.%f"), item["value"], item["dt_ms"]) for item in batch]
+        cursor.executemany(sql, values)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"✅ 寫入 {len(batch)} 筆資料")
+    except Exception as e:
+        print(f"[SQL錯誤] {e}")
+
+
+# ---------- MQTT 回呼 ----------
+def on_connect(client, userdata, flags, rc):
+    print("✅ MQTT Connected:", rc)
+    client.subscribe(TOPIC_ADC)
+
+
+def on_message(client, userdata, msg):
+    global data_buffer, batch_count
+    payload = msg.payload.decode("utf-8", errors="ignore")
+    try:
+        batch = json.loads(payload)
+        if isinstance(batch, list):
+            prev_ts = None
+            for item in batch:
+                ts = ts_to_datetime(item["ts_sec"], item["ts_usec"])
+                value = item["value"]
+                # 計算 dt (毫秒)
+                if prev_ts is not None:
+                    dt_ms = (ts - prev_ts).total_seconds() * 1000
+                else:
+                    dt_ms = 0.0
+                prev_ts = ts
+                data_buffer.append({"timestamp": ts, "value": value, "dt_ms": dt_ms})
+               
+                # 超過 500 筆寫入 MySQL
+                if len(data_buffer) >= BATCH_SIZE:
+                    batch_count += 1
+                    insert_batch(data_buffer)
+                    data_buffer = []
+    except Exception as e:
+        print(f"[解析錯誤] {e}")
+
+
+# ---------- MQTT 執行緒 ----------
+def mqtt_thread():
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(BROKER, PORT, 60)
+    client.loop_forever()
+
+
+# ---------- 主程式 ----------
+if __name__ == "__main__":
+    t = threading.Thread(target=mqtt_thread, daemon=True)
+    t.start()
+    print("🚀 MQTT 接收程式啟動")
+    t.join()
+
+
+
+
+
+CREATE DATABASE IF NOT EXISTS adc_db
+USE adc_db;
+CREATE TABLE	adc_data(
+	id INT AUTO_INCREMENT PRIMARY KEY,
+	timestamp DATETIME(6),
+	`value` FLOAT,
+	dt_ms FLOAT 
+);
+
+SHOW TABLES;
+SELECT *from adc_data LIMIT 2000;
+
+
+import pymysql
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# ---------- MySQL 設定 ----------
+DB_HOST = 'localhost'
+DB_USER = '你的帳號'
+DB_PASSWORD = '你的密碼'
+DB_NAME = 'adc_db'
+TABLE_NAME = 'adc_data2'
+
+# ---------- 連線 ----------
+conn = pymysql.connect(
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    database=DB_NAME
+)
+
+cursor = conn.cursor()
+
+# ---------- 讀取資料 ----------
+# 假設只取最新 500 筆
+sql = f"SELECT timestamp, value, dt_ms FROM {TABLE_NAME} ORDER BY id DESC LIMIT 500"
+cursor.execute(sql)
+rows = cursor.fetchall()
+
+conn.close()
+
+# ---------- 解析資料 ----------
+timestamps = []
+values = []
+dt_list = []
+
+start_time = None
+acc_time = 0.0
+
+for row in reversed(rows):  # 從最舊到最新
+    ts, value, dt = row
+    if start_time is None:
+        start_time = ts
+        acc_time = 0.0
+    else:
+        acc_time += dt  # 累加 dt
+    timestamps.append(acc_time)  # X 軸: 累積時間(ms)
+    values.append(value)
+    dt_list.append(dt)
+
+# ---------- 畫圖 ----------
+plt.figure(figsize=(12, 6))
+plt.plot(timestamps, values, marker='o', linestyle='-')
+plt.xlabel("累積時間 (ms)")
+plt.ylabel("ADC Value (mV)")
+plt.title("ADC 500 筆資料")
+plt.grid(True)
+plt.show()
+
+
