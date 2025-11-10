@@ -43,7 +43,7 @@ struct Sample {
 };
 
 // ---------- Batch settings ----------
-#define BATCH_SIZE 128
+#define BATCH_SIZE 100
 Sample batchBuffer[BATCH_SIZE];
 int sampleIndex = 0;
 uint32_t batchCount = 0;
@@ -67,26 +67,36 @@ void connectToMQTT() {
 }
 
 // ---------- Send batch ----------
-void sendBatch(Sample* buf, int size, const char* topic){
+void sendBatch(Sample* buf, int size, const char* topic) {
   timeClient.update();
   unsigned long ts_epoch = timeClient.getEpochTime(); // 台灣時間秒數
 
+  // 開始組成 JSON 陣列
   int len = 0;
-  for(int i=0;i<size;i++){
-    len += snprintf(payload+len,sizeof(payload)-len,
-                    "%.1f,%u,%u,%.1f%s",
+  len += snprintf(payload + len, sizeof(payload) - len, "[");
+
+  for (int i = 0; i < size; i++) {
+    len += snprintf(payload + len, sizeof(payload) - len,
+                    "{\"value\":%.2f,\"ts_sec\":%u,\"ts_usec\":%u,\"rate\":%.1f}%s",
                     buf[i].value,
                     buf[i].ts_sec,
                     buf[i].ts_usec,
                     buf[i].sampleRate,
-                    (i<size-1)?",":"");
+                    (i < size - 1) ? "," : "");
   }
-  len += snprintf(payload+len,sizeof(payload)-len,";%lu", ts_epoch);
 
-  if(!mqtt_client.connected()) connectToMQTT();
+  len += snprintf(payload + len, sizeof(payload) - len, "]");
+
+  if (!mqtt_client.connected()) connectToMQTT();
   mqtt_client.publish(topic, payload);
   mqtt_client.loop();
+
+  Serial.print("發送筆數=");
+  Serial.print(size);
+  Serial.print(" Payload大小=");
+  Serial.println(len);
 }
+
 
 // ---------- Setup ----------
 void setup() {
@@ -153,9 +163,9 @@ void loop() {
     ADS.requestADC_Differential_0_1();
   }
 
-// 每隔 讀一次 DHT22 (每 10 秒可調)
+// 每隔 讀一次 DHT22 (每 600 秒可調)
 static unsigned long lastDHTMillis = 0;
-if(millis() - lastDHTMillis >= 10000){ // 10000 = 10 秒
+if(millis() - lastDHTMillis >= 600000){ // DIV1000 =  秒
   lastDHTMillis = millis();
 
   float h = dht.readHumidity();
