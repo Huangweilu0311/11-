@@ -8,7 +8,7 @@
 
 // ---------- Deep Sleep 設定 ----------
 #define uS_TO_S_FACTOR 1000000ULL  // 微秒轉秒
-#define TIME_TO_SLEEP  600          // 喚醒時間（秒）
+#define TIME_TO_SLEEP  10          // 喚醒時間（秒）
 
 RTC_DATA_ATTR int bootCount = 0;
 
@@ -71,9 +71,9 @@ void setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_SVGA;
+  config.frame_size = FRAMESIZE_QVGA;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 35;
+  config.jpeg_quality = 40;
   config.fb_count = 2;
 
   if (esp_camera_init(&config) != ESP_OK) {
