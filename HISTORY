@@ -2,16 +2,17 @@ import paho.mqtt.client as mqtt
 import pymysql
 import json
 from datetime import datetime
-import base64
 import threading
 import time
+import base64
+import os
 
 # ---------- 資料庫設定 ----------
 DB_CONFIG = {
     "host": "localhost",
     "user": "mqttuser",
     "password": "gs5g4432",
-    "database": "camtcs"  # 專用 DB
+    "database": "camtcs"
 }
 
 # ---------- MQTT 設定 ----------
@@ -48,13 +49,13 @@ def insert_image_info(image_id, size, filename=None):
     finally:
         conn.close()
 
-def insert_image_chunk(image_id, chunk_index, total_chunks, bin_data):
+def insert_image_chunk(image_id, chunk_index, total_chunks, data):
     try:
         conn = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor()
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
         sql = "INSERT INTO cam_data (timestamp, image_id, chunk_index, total_chunks, data) VALUES (%s, %s, %s, %s, %s)"
-        cursor.execute(sql, (ts, image_id, chunk_index, total_chunks, bin_data))
+        cursor.execute(sql, (ts, image_id, chunk_index, total_chunks, data))
         conn.commit()
     except Exception as e:
         print(f"Image chunk insert error (id={image_id} chunk={chunk_index}):", e)
@@ -94,14 +95,13 @@ def on_message(client, userdata, msg):
             total_chunks = data.get("total")
             b64data = data.get("data")
             if None not in (image_id, chunk_index, total_chunks, b64data):
-                bin_data = base64.b64decode(b64data)
-                insert_image_chunk(image_id, chunk_index, total_chunks, bin_data)
+                insert_image_chunk(image_id, chunk_index, total_chunks, b64data)
                 print(f"Image chunk saved: id={image_id} chunk {chunk_index}/{total_chunks-1}")
 
     except Exception as e:
         print("Error in on_message:", e)
 
-# ---------- 啟動 MQTT 並在背景執行緒 ----------
+# ---------- 啟動 MQTT ----------
 def start_mqtt():
     client = mqtt.Client()
     client.on_connect = on_connect
@@ -115,11 +115,39 @@ mqtt_thread.start()
 
 print("MQTT client started in background, waiting for messages...")
 
-# ---------- 主程式可以做其他任務 ----------
+# ---------- 從資料庫還原完整圖片 ----------
+def restore_image(image_id, output_filename):
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        sql = "SELECT chunk_index, total_chunks, data FROM cam_data WHERE image_id=%s ORDER BY chunk_index ASC"
+        cursor.execute(sql, (image_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            print(f"No data found for image_id={image_id}")
+            return
+
+        img_bytes = b""
+        for idx, total, b64chunk in rows:
+            img_bytes += base64.b64decode(b64chunk)
+
+        with open(output_filename, "wb") as f:
+            f.write(img_bytes)
+        print(f"Image restored to {output_filename} ({len(img_bytes)} bytes)")
+
+    except Exception as e:
+        print("Restore image error:", e)
+    finally:
+        conn.close()
+
+# ---------- 主程式 ----------
+
 try:
     while True:
-        # 這裡可以執行其他程式，例如顯示圖片、GUI、或計算
-        print("主程式正在執行其他任務...")
+        # 例：每 30 秒嘗試還原最新圖片
+        restore_image_id = input("輸入要還原的 image_id (或按 Enter 跳過): ").strip()
+        if restore_image_id:
+            restore_image(restore_image_id, f"{restore_image_id}.jpg")
         time.sleep(5)
 
 except KeyboardInterrupt:
