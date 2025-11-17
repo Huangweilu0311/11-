@@ -1,0 +1,98 @@
+import paho.mqtt.client as mqtt
+import pymysql
+import json
+import base64
+from datetime import datetime
+
+# ---------- MySQL 設定 ----------
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "mqttuser",
+    "password": "gs5g4432",
+    "database": "camtcs"
+}
+
+# ---------- MQTT 設定 ----------
+MQTT_BROKER = "192.168.1.8"
+MQTT_PORT = 1883
+TOPIC_TCS = "esp32/camera/tcs_data"
+TOPIC_IMAGE_INFO = "esp32/camera/info"
+TOPIC_IMAGE_DATA = "esp32/camera/data"
+
+# ---------- 資料庫操作 ----------
+def insert_tcs_data(r, g, b, c):
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    sql = "INSERT INTO tcs (timestamp, R, G, B, C) VALUES (%s, %s, %s, %s, %s)"
+    cursor.execute(sql, (ts, r, g, b, c))
+    conn.commit()
+    conn.close()
+    print(f"TCS chunk saved: R={r} G={g} B={b} C={c}")
+
+def insert_image_info(image_id, size):
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    sql = "INSERT INTO cam_info (timestamp, image_id, size) VALUES (%s, %s, %s)"
+    cursor.execute(sql, (ts, image_id, size))
+    conn.commit()
+    conn.close()
+    print(f"Image info saved: id={image_id} size={size}")
+
+def insert_image_chunk(image_id, chunk_index, total_chunks, data):
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    sql = "INSERT INTO cam_data (image_id, chunk_index, total_chunks, data, timestamp) VALUES (%s,%s,%s,%s,%s)"
+    cursor.execute(sql, (image_id, chunk_index, total_chunks, data, ts))
+    conn.commit()
+    conn.close()
+    # chunk_index 從 0 開始，所以顯示時加 1
+    print(f"CAM chunk saved: id={image_id} chunk {chunk_index+1}/{total_chunks}")
+
+# ---------- MQTT 回呼函式 ----------
+def on_connect(client, userdata, flags, rc):
+    print("MQTT connected with result code", rc)
+    client.subscribe([(TOPIC_TCS, 0), (TOPIC_IMAGE_INFO, 0), (TOPIC_IMAGE_DATA, 0)])
+
+def on_message(client, userdata, msg):
+    payload = msg.payload.decode()
+    try:
+        data = json.loads(payload)
+    except:
+        print("Invalid JSON:", payload)
+        return
+
+    if msg.topic == TOPIC_TCS:
+        r = data.get("R")
+        g = data.get("G")
+        b = data.get("B")
+        c = data.get("C")
+        if None not in (r, g, b, c):
+            insert_tcs_data(r, g, b, c)
+
+    elif msg.topic == TOPIC_IMAGE_INFO:
+        image_id = data.get("id")
+        size = data.get("size")
+        if image_id and size is not None:
+            insert_image_info(image_id, size)
+
+    elif msg.topic == TOPIC_IMAGE_DATA:
+        image_id = data.get("id")
+        chunk_index = data.get("chunk")
+        total_chunks = data.get("total")
+        chunk_base64 = data.get("data")
+        if image_id and chunk_base64 is not None:
+            # 轉成二進位
+            bin_data = base64.b64decode(chunk_base64)
+            insert_image_chunk(image_id, chunk_index, total_chunks, bin_data)
+
+# ---------- 啟動 MQTT ----------
+client = mqtt.Client()
+client.on_connect = on_connect
+client.on_message = on_message
+
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+print("MQTT client started, waiting for messages...")
+client.loop_forever()
