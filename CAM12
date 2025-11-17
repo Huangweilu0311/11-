@@ -1,0 +1,53 @@
+import pymysql
+import base64
+from PIL import Image, ImageFile
+import io
+import os
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # 允許不完整圖片
+
+# ---------- DB 設定 ----------
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "mqttuser",
+    "password": "gs5g4432",
+    "database": "camtcs"
+}
+
+# ---------- 輸出資料夾 ----------
+OUTPUT_DIR = "images"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ---------- 連線 ----------
+conn = pymysql.connect(**DB_CONFIG)
+cursor = conn.cursor()
+
+# 取得所有 image_id
+cursor.execute("SELECT DISTINCT image_id FROM cam_data")
+image_ids = [row[0] for row in cursor.fetchall()]
+
+print(f"共有 {len(image_ids)} 張圖片")
+
+for image_id in image_ids:
+    # 取該圖片所有 chunk，按 chunk_index 排序
+    cursor.execute("SELECT chunk_index, data FROM cam_data WHERE image_id=%s ORDER BY chunk_index ASC", (image_id,))
+    chunks = cursor.fetchall()
+
+    if not chunks:
+        print(f"找不到圖片 {image_id} 的 chunk 資料")
+        continue
+
+    # 合併 Base64
+    full_b64 = "".join([row[1] for row in chunks])
+
+    try:
+        img_bytes = base64.b64decode(full_b64)
+        img = Image.open(io.BytesIO(img_bytes))
+        output_path = os.path.join(OUTPUT_DIR, f"{image_id}.jpg")
+        img.save(output_path)
+        print(f"圖片 {image_id} 已儲存: {output_path}")
+    except Exception as e:
+        print(f"圖片 {image_id} 解碼/儲存失敗:", e)
+
+cursor.close()
+conn.close()
