@@ -8,8 +8,7 @@
 
 // ---------- Deep Sleep 設定 ----------
 #define uS_TO_S_FACTOR 1000000ULL  // 微秒轉秒
-#define TIME_TO_SLEEP  10          // 喚醒時間（秒）
-
+#define TIME_TO_SLEEP  30          // 喚醒時間（秒）
 RTC_DATA_ATTR int bootCount = 0;
 
 // ---------- ESP32-CAM AI-Thinker 引腳 ----------
@@ -29,12 +28,12 @@ RTC_DATA_ATTR int bootCount = 0;
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
-#define LED_GPIO_NUM      4
+#define LED_GPIO_NUM       4
 
 // ---------- TCS34725 ----------
 #define TCS_SDA_PIN 14
 #define TCS_SCL_PIN 15
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_154MS, TCS34725_GAIN_1X);
+Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_154MS, TCS34725_GAIN_1X);
 
 // ---------- WiFi / MQTT ----------
 const char* ssid = "LS Lab2";
@@ -45,10 +44,12 @@ const char* mqtt_topic_tcs = "esp32/camera/tcs_data";
 const char* mqtt_topic_info = "esp32/camera/info";
 const char* mqtt_topic_data = "esp32/camera/data";
 
+#define MQTT_KEEPALIVE 60  // 60 秒
+
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 
-// ---------- Camera 初始化 ----------
+// ---------- 初始化 Camera ----------
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -71,57 +72,58 @@ void setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
+  config.frame_size = FRAMESIZE_SVGA;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 40;
   config.fb_count = 2;
 
-  if (esp_camera_init(&config) != ESP_OK) {
+  if (esp_camera_init(&config) != ESP_OK)
     Serial.println("Camera init failed!");
-  } else {
+  else
     Serial.println("Camera initialized!");
-  }
 }
 
-// ---------- WiFi & MQTT ----------
+// ---------- WiFi ----------
 void connectToWiFi() {
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(300);
     Serial.print(".");
   }
   Serial.println("\nWiFi connected!");
 }
 
+// ---------- MQTT ----------
 void connectToMQTT() {
   mqtt_client.setServer(mqtt_broker, mqtt_port);
+
   while (!mqtt_client.connected()) {
     Serial.print("Connecting to MQTT...");
-    String clientId = "ESP32CAM-" + String(random(0xffff), HEX);
-    if (mqtt_client.connect(clientId.c_str())) {
+    String cid = "ESP32CAM-" + String(random(0xffff), HEX);
+
+    // PubSubClient 預設 3.1.1，若 Broker 要求 3.1，可修改 PubSubClient.h
+    if (mqtt_client.connect(cid.c_str(), nullptr, nullptr, nullptr, 0, false, nullptr, MQTT_KEEPALIVE)) {
       Serial.println("connected!");
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqtt_client.state());
-      Serial.println(" try again in 5s");
-      delay(5000);
+      Serial.print("MQTT failed rc=");
+      Serial.println(mqtt_client.state());
+      delay(2000);
     }
   }
 }
 
-// ---------- 發送 TCS 數據 ----------
+// ---------- 傳送 TCS ----------
 void sendTCS() {
   uint16_t r, g, b, c;
   tcs.getRawData(&r, &g, &b, &c);
   Serial.printf("TCS R:%d G:%d B:%d C:%d\n", r, g, b, c);
 
-  String tcsData = "{\"R\":" + String(r) + ",\"G\":" + String(g) + 
-                   ",\"B\":" + String(b) + ",\"C\":" + String(c) + "}";
-  mqtt_client.publish(mqtt_topic_tcs, tcsData.c_str());
+  String msg = "{\"R\":" + String(r) + ",\"G\":" + String(g) + ",\"B\":" + String(b) + ",\"C\":" + String(c) + "}";
+  mqtt_client.publish(mqtt_topic_tcs, msg.c_str());
 }
 
-// ---------- 拍照 & 發送 ----------
+// ---------- 拍照 + 分段上傳 ----------
 void sendPhoto() {
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
@@ -129,25 +131,22 @@ void sendPhoto() {
     return;
   }
 
-  String imageBase64 = base64::encode(fb->buf, fb->len);
-  String imageId = String(millis());
+  String id = String(millis());
+  String b64 = base64::encode(fb->buf, fb->len);
 
-  // 發送圖片資訊
-  String info = "{\"id\":\"" + imageId + "\",\"size\":" + String(fb->len) + "}";
+  // 發送照片資訊
+  String info = "{\"id\":\"" + id + "\",\"size\":" + String(fb->len) + "}";
   mqtt_client.publish(mqtt_topic_info, info.c_str());
 
-  // 分段發送
-  const int maxChunk = 4000;
-  int totalChunks = (imageBase64.length() + maxChunk - 1) / maxChunk;
-  for (int i = 0; i < totalChunks; i++) {
+  int maxChunk = 4000;
+  int total = (b64.length() + maxChunk - 1) / maxChunk;
+
+  for (int i = 0; i < total; i++) {
     int start = i * maxChunk;
-    int len = min(maxChunk, (int)(imageBase64.length() - start));
-    String chunk = imageBase64.substring(start, start + len);
-    String chunkMsg = "{\"id\":\"" + imageId + "\",\"chunk\":" + String(i) +
-                      ",\"total\":" + String(totalChunks) + ",\"data\":\"" + chunk + "\"}";
-    mqtt_client.publish(mqtt_topic_data, chunkMsg.c_str());
-    delay(50);
-    mqtt_client.loop();
+    String chunk = b64.substring(start, start + maxChunk);
+    String msg = "{\"id\":\"" + id + "\",\"chunk\":" + String(i) + ",\"total\":" + String(total) + ",\"data\":\"" + chunk + "\"}";
+    mqtt_client.publish(mqtt_topic_data, msg.c_str());
+    delay(40);
   }
 
   esp_camera_fb_return(fb);
@@ -155,7 +154,7 @@ void sendPhoto() {
 
 // ---------- Deep Sleep ----------
 void goToDeepSleep() {
-  Serial.printf("Going to deep sleep for %d seconds...\n", TIME_TO_SLEEP);
+  Serial.printf("Going to deep sleep for %d sec...\n", TIME_TO_SLEEP);
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
   Serial.flush();
   esp_deep_sleep_start();
@@ -164,30 +163,41 @@ void goToDeepSleep() {
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
+
   bootCount++;
   Serial.printf("Boot count: %d\n", bootCount);
 
   pinMode(LED_GPIO_NUM, OUTPUT);
   digitalWrite(LED_GPIO_NUM, HIGH);
 
-  Wire.begin(TCS_SDA_PIN, TCS_SCL_PIN);
-  if (!tcs.begin()) Serial.println("TCS34725 not found!");
-  else Serial.println("TCS34725 initialized!");
-
   setupCamera();
+  delay(300);
+
+  Wire.begin(TCS_SDA_PIN, TCS_SCL_PIN);
+  Wire.setClock(50000);
+  delay(100);
+  if (!tcs.begin())
+    Serial.println("TCS34725 init failed!");
+  else
+    Serial.println("TCS34725 initialized!");
 
   connectToWiFi();
+  delay(300);
   connectToMQTT();
+  delay(300);
 
   sendTCS();
+  delay(200);
   sendPhoto();
 
   digitalWrite(LED_GPIO_NUM, LOW);
+  delay(200);
 
   goToDeepSleep();
 }
 
+// ---------- Loop ----------
 void loop() {
-  // Deep Sleep 後會重新執行 setup()
-}
+  // Deep Sleep 每次都會重新執行 setup()
+}}
