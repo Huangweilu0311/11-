@@ -1,0 +1,147 @@
+import sys
+import serial
+import threading
+import numpy as np
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QInputDialog
+from PyQt6.QtCore import pyqtSignal, QObject
+import pyqtgraph as pg
+from PyQt6.QtGui import QFont
+
+# --------------------------
+# 串口讀取類別
+# --------------------------
+class SerialReader(QObject):
+    data_received = pyqtSignal(str)
+
+    def __init__(self, port="COM3", baudrate=115200):
+        super().__init__()
+        self.ser = serial.Serial(port, baudrate, timeout=1)
+        self.running = True
+        self.thread = threading.Thread(target=self.read_loop, daemon=True)
+        self.thread.start()
+
+    def read_loop(self):
+        while self.running:
+            try:
+                line = self.ser.readline().decode("ascii", errors="ignore").strip()
+                if line:
+                    self.data_received.emit(line)
+            except Exception as e:
+                print("Serial read error:", e)
+
+    def stop(self):
+        self.running = False
+        self.ser.close()
+
+# --------------------------
+# 主視窗
+# --------------------------
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ESP32 即時波形")
+        self.resize(600, 400)
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        # --------------------------
+        # 使用者輸入參數
+        # --------------------------
+        hz, ok1 = QInputDialog.getInt(self, "輸入頻率", "請輸入 Hz：", min=1, max=10000)
+        amplitude, ok2 = QInputDialog.getInt(self, "輸入震幅", "請輸入震幅 (mV)：", min=1, max=2000)
+        offset, ok3 = QInputDialog.getInt(self, "輸入偏移量", "請輸入 Offset (mV)：", min=-2000, max=2000)
+        N, ok4 = QInputDialog.getInt(self, "輸入視窗筆數", "請輸入視窗顯示筆數：", min=10, max=500)
+
+        if not (ok1 and ok2 and ok3 and ok4):
+            sys.exit()
+
+        self.N = N
+
+        # 顯示參數
+        self.label_params = QLabel(f"頻率: {hz} Hz | 震幅: {amplitude} mV | 偏移量: {offset} mV")
+        self.label_params.setStyleSheet("color: black; font-size: 16pt; font-weight: bold;")
+        self.layout.addWidget(self.label_params)
+
+        self.label_total_time = QLabel("波形總時間: 0 ms")
+        self.label_total_time.setStyleSheet("color: black; font-size: 14pt; font-weight: bold;")
+        self.layout.addWidget(self.label_total_time)
+
+        # --------------------------
+        # pyqtgraph 波形
+        # --------------------------
+        pg.setConfigOption('background', 'w')
+        pg.setConfigOption('foreground', 'k')
+
+        self.plot_wave = pg.PlotWidget(title="即時波形")
+        self.plot_wave.showGrid(x=True, y=True, alpha=10)
+        self.plot_wave.setLabel("left", "差分電壓", units="mV", **{'font-size': '14pt'})
+        self.plot_wave.setLabel("bottom", "時間", units="ms", **{'font-size': '14pt'})
+        self.curve_wave = self.plot_wave.plot(pen=pg.mkPen(color="b", width=6))
+        self.layout.addWidget(self.plot_wave)
+
+        # --------------------------
+        # 設定軸刻度字體大小
+        # --------------------------
+        font_axis = QFont("Arial", 12)
+        self.plot_wave.getAxis("left").setTickFont(font_axis)
+        self.plot_wave.getAxis("bottom").setTickFont(font_axis)
+
+        # --------------------------
+        # 資料緩衝
+        # --------------------------
+        self.x_data = []
+        self.y_data = []
+        self.update_counter = 0
+        self.update_interval = 100  # 每收到100筆更新一次
+
+        # --------------------------
+        # 啟動串口
+        # --------------------------
+        self.serial_reader = SerialReader(port="COM3", baudrate=115200)
+        self.serial_reader.data_received.connect(self.update_data)
+
+    # --------------------------
+    # 更新資料
+    # --------------------------
+    def update_data(self, line):
+        if line.startswith("dt="):
+            try:
+                parts = line.split(",")
+                diff_val = int(parts[1].split("=")[1].replace("mV", "").strip())
+                dt_val = int(parts[0].split("=")[1].replace("us", "").strip())
+
+                # 累積時間(ms)
+                if self.x_data:
+                    self.x_data.append(self.x_data[-1] + dt_val / 1000)
+                else:
+                    self.x_data.append(0)
+
+                self.y_data.append(diff_val)
+
+                # 限制資料在視窗內筆數
+                if len(self.x_data) > self.N:
+                    self.x_data = self.x_data[-self.N:]
+                    self.y_data = self.y_data[-self.N:]
+
+                # 更新波形
+                self.update_counter += 1
+                if self.update_counter >= self.update_interval:
+                    self.update_counter = 0
+                    total_time = self.x_data[-1] - self.x_data[0] if len(self.x_data) > 1 else 0
+                    self.label_total_time.setText(f"視窗總時間: {total_time:.2f} ms")
+                    self.curve_wave.setData(self.x_data, self.y_data)
+
+            except Exception:
+                pass
+
+    def closeEvent(self, event):
+        self.serial_reader.stop()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
