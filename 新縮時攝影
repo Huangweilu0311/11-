@@ -1,0 +1,171 @@
+import paho.mqtt.client as mqtt
+import pymysql
+import json
+from datetime import datetime
+import threading
+import time
+import base64
+import os
+
+# ---------- 資料庫設定 (不變) ----------
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "mqttuser",
+    "password": "gs5g4432",
+    "database": "camtcs"
+}
+
+# ---------- MQTT 設定 (已修正 Broker) ----------
+MQTT_BROKER = "broker.emqx.io" # <--- 已變更為公共 Broker
+MQTT_PORT = 1883
+
+# 圖片資料 Topics
+TOPIC_IMAGE_INFO = "esp32/camera/info"
+TOPIC_IMAGE_DATA = "esp32/camera/data"
+TOPIC_IMAGE_COMPLETE = "esp32/camera/complete"
+
+# 握手與 ACK Topics
+TOPIC_STATUS = "esp32/camera/status"       # 來自 ESP32 的上線通知
+TOPIC_CMD = "esp32/camera/cmd"           # 發給 ESP32 的握手 OK (內容: "ok")
+TOPIC_CHUNK_ACK = "esp32/camera/chunk_ack" # 發給 ESP32 的分段 ACK (內容: "CHUNK_ACK")
+
+# ---------- 資料庫操作 (不變) ----------
+
+def insert_image_info(image_id, size, filename=None):
+    """將圖片資訊寫入 cam_info"""
+    conn = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        sql = "INSERT INTO cam_info (timestamp, image_id, filename, size) VALUES (%s,%s,%s,%s)"
+        cursor.execute(sql, (ts, image_id, filename, size))
+        conn.commit()
+        print(f"Image info saved: id={image_id}, size={size}")
+    except Exception as e:
+        print("Image info insert error:", e)
+    finally:
+        if conn:
+            conn.close()
+
+def insert_image_chunk(image_id, chunk_index, total_chunks, data):
+    """將 Base64 分段寫入 cam_data"""
+    conn = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        sql = "INSERT INTO cam_data (timestamp, image_id, chunk_index, total_chunks, data) VALUES (%s,%s,%s,%s,%s)"
+        cursor.execute(sql, (ts, image_id, chunk_index, total_chunks, data))
+        conn.commit()
+    except Exception as e:
+        print(f"Image chunk insert error (id={image_id} chunk={chunk_index}):", e)
+    finally:
+        if conn:
+            conn.close()
+
+# ---------- MQTT 回呼 (修正後的 ACK 邏輯) ----------
+
+def on_connect(client, userdata, flags, rc):
+    print("MQTT connected with result code", rc)
+    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_IMAGE_INFO, 0), (TOPIC_IMAGE_DATA, 0), (TOPIC_IMAGE_COMPLETE, 0)])
+
+def on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode()
+        
+        # --- 1. 握手啟動 ---
+        if msg.topic == TOPIC_STATUS:
+            if payload == "ESP32-CAM Online":
+                print("\n[Status] ESP32-CAM is Online. Sending Handshake OK...")
+                client.publish(TOPIC_CMD, "ok", qos=0) 
+            return 
+
+        # 以下處理 JSON 數據
+        data = json.loads(payload)
+        print(f"Received topic: {msg.topic}, payload[:100]: {payload[:100]}...")
+
+        # ---- 影像資訊 ----
+        if msg.topic == TOPIC_IMAGE_INFO:
+            image_id = data.get("id")
+            original_size = data.get("original_size")
+            if image_id and original_size is not None:
+                insert_image_info(image_id, original_size)
+
+        # ---- 分段資料 ----
+        elif msg.topic == TOPIC_IMAGE_DATA:
+            image_id = data.get("id")
+            chunk_index = data.get("chunk")
+            total_chunks = data.get("total")
+            b64data = data.get("data")
+            
+            if None not in (image_id, chunk_index, total_chunks, b64data):
+                insert_image_chunk(image_id, chunk_index, total_chunks, b64data)
+                
+                # --- 2. 回覆單段 ACK ---
+                client.publish(TOPIC_CHUNK_ACK, "CHUNK_ACK", qos=0) 
+                print(f"Sent CHUNK_ACK for chunk {chunk_index}")
+
+        # ---- 完成訊息 ----
+        elif msg.topic == TOPIC_IMAGE_COMPLETE:
+            image_id = data.get("id")
+            print(f"Image transfer complete for id={image_id}")
+
+    except json.JSONDecodeError:
+        print("Error: Failed to decode JSON payload")
+    except Exception as e:
+        print("Error in on_message:", e)
+
+# ---------- MQTT 啟動 (不變) ----------
+def start_mqtt():
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    try:
+        # 使用公共 Broker 連線
+        client.connect(MQTT_BROKER, MQTT_PORT, 60) 
+        client.loop_forever()
+    except Exception as e:
+        print(f"MQTT connection error: {e}")
+
+mqtt_thread = threading.Thread(target=start_mqtt)
+mqtt_thread.daemon = True
+mqtt_thread.start()
+print("MQTT client started in background, waiting for images...")
+
+# ---------- 從資料庫還原完整圖片 (不變) ----------
+def restore_image(image_id, output_filename):
+    conn = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        sql = "SELECT chunk_index, data FROM cam_data WHERE image_id=%s ORDER BY chunk_index ASC"
+        cursor.execute(sql, (image_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            print(f"No data for image_id={image_id}")
+            return
+        full_b64 = "".join([row[1].strip() for row in rows])
+        img_bytes = base64.b64decode(full_b64)
+        with open(output_filename, "wb") as f:
+            f.write(img_bytes)
+        cursor.execute("UPDATE cam_info SET filename=%s WHERE image_id=%s", (output_filename, image_id))
+        conn.commit()
+        print(f"Image restored to {output_filename} ({len(img_bytes)} bytes)")
+    except Exception as e:
+        print("Restore image error:", e)
+    finally:
+        if conn:
+            conn.close()
+
+# ---------- 互動還原 (不變) ----------
+try:
+    while True:
+        restore_id = input("\n輸入 image_id 還原圖片 (或 Enter 跳過): ").strip()
+        if restore_id:
+            restore_image(restore_id, f"restored_{restore_id}.jpg")
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n程式結束")
+    os._exit(0)
