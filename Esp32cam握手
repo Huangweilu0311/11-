@@ -1,0 +1,244 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Base64.h>
+#include "esp_sleep.h"
+
+// ---------- ESP32-CAM AI-Thinker GPIO ----------
+#define PWDN_GPIO_NUM       32
+#define RESET_GPIO_NUM      -1
+#define XCLK_GPIO_NUM        0
+#define SIOD_GPIO_NUM       26
+#define SIOC_GPIO_NUM       27
+#define Y9_GPIO_NUM         35
+#define Y8_GPIO_NUM         34
+#define Y7_GPIO_NUM         39
+#define Y6_GPIO_NUM         36
+#define Y5_GPIO_NUM         21
+#define Y4_GPIO_NUM         19
+#define Y3_GPIO_NUM         18
+#define Y2_GPIO_NUM          5
+#define VSYNC_GPIO_NUM      25
+#define HREF_GPIO_NUM       23
+#define PCLK_GPIO_NUM       22
+#define FLASH_LED_PIN 4
+
+// ---------- Wi-Fi ----------
+const char* ssid = "LS Lab2";
+const char* password = "gs5g4432";
+
+// ---------- MQTT ----------
+const char* mqtt_broker = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* mqtt_topic_info = "esp32/camera/info";
+const char* mqtt_topic_data = "esp32/camera/data";
+const char* mqtt_topic_complete = "esp32/camera/complete";
+const char* mqtt_status_topic = "esp32/camera/status";
+const char* mqtt_cmd_topic = "esp32/camera/cmd";
+const char* mqtt_chunk_ack = "esp32/camera/chunk_ack";
+const char* mqtt_username = "esp32cam_image";
+const char* mqtt_password = "esp32cam_image";
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// ---------- 拍照與流程控制 ----------
+const unsigned long photoInterval = 600; // 10 分鐘
+bool waitingForOK = false;
+unsigned long okWaitStart = 0;
+const unsigned long okTimeout = 60000;
+volatile bool chunkAckReceived = false;
+int lastChunkAck = -1;
+const unsigned long chunkTimeout = 5000;
+const int maxChunkRetries = 5;
+const int maxPhotoRetries = 3;
+unsigned long lastPhotoTime = 0;
+
+// ---------- Camera Setup ----------
+void setupCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; 
+    config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM; 
+    config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM; 
+    config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM; 
+    config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM; 
+    config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM; 
+    config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM; 
+    config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM; 
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 40;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    if (!psramFound()) {
+        config.frame_size = FRAMESIZE_QVGA;
+        config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+
+    if (esp_camera_init(&config) != ESP_OK) {
+        Serial.println("Camera init failed!");
+        return;
+    }
+    Serial.println("Camera initialized!");
+}
+
+// ---------- Wi-Fi ----------
+void setupWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    WiFi.setSleep(true);
+    Serial.print("Connecting Wi-Fi...");
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+        delay(500); Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) Serial.println("Wi-Fi connected!");
+    else Serial.println("Wi-Fi connect failed!");
+}
+
+// ---------- MQTT Callback ----------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String msg;
+    for (int i=0; i<length; i++) msg += (char)payload[i];
+
+    // 握手 OK
+    if (String(topic) == mqtt_cmd_topic && msg == "ok") {
+        waitingForOK = false;
+        Serial.println("Received OK from Python!");
+    }
+
+    // 分段 ACK
+    if (String(topic) == mqtt_chunk_ack) {
+        int ackNum = msg.toInt();
+        lastChunkAck = ackNum;
+    }
+}
+
+// ---------- MQTT Connect ----------
+void connectToMQTT() {
+    mqtt_client.setServer(mqtt_broker, mqtt_port);
+    mqtt_client.setCallback(mqttCallback);
+    mqtt_client.setBufferSize(8192);
+
+    if (mqtt_client.connected()) return;
+
+    unsigned long start = millis();
+    while (!mqtt_client.connected() && millis() - start < 15000) {
+        String clientId = "ESP32CAM-" + String(random(0xffff), HEX);
+        Serial.print("Connecting MQTT...");
+        if (mqtt_client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+            Serial.println("MQTT connected!");
+            mqtt_client.publish(mqtt_status_topic, "ESP32-CAM Online", true);
+            mqtt_client.subscribe(mqtt_cmd_topic);
+            mqtt_client.subscribe(mqtt_chunk_ack);
+            return;
+        } else {
+            Serial.print("failed, rc="); Serial.println(mqtt_client.state());
+            delay(3000);
+        }
+    }
+}
+
+// ---------- 分段傳送 ----------
+bool sendImageChunks(String imageId, String &imageBase64) {
+    const int maxChunkSize = 700;
+    int totalChunks = (imageBase64.length() + maxChunkSize - 1) / maxChunkSize;
+
+    for (int i=0; i<totalChunks; i++) {
+        int retry=0;
+        bool sent=false;
+        int startPos = i*maxChunkSize;
+        int chunkSize = min(maxChunkSize,(int)(imageBase64.length()-startPos));
+        String chunk = imageBase64.substring(startPos,startPos+chunkSize);
+        String chunkJson = "{\"id\":\""+imageId+"\",\"chunk\":"+String(i)+
+                            ",\"total\":"+String(totalChunks)+
+                            ",\"data\":\""+chunk+"\"}";
+        while(!sent && retry<maxChunkRetries) {
+            lastChunkAck = -1;
+            mqtt_client.publish(mqtt_topic_data, chunkJson.c_str(), false, 0);
+            unsigned long startWait = millis();
+            while(lastChunkAck != i && millis()-startWait < chunkTimeout) {
+                mqtt_client.loop(); delay(10);
+            }
+            if(lastChunkAck == i) sent=true;
+            else { retry++; Serial.printf("Chunk %d retry %d\n",i,retry); delay(500);}
+        }
+        if(!sent) return false;
+    }
+    // 發送 COMPLETE
+    String completeMsg = "{\"id\":\""+imageId+"\",\"status\":\"complete\",\"chunks\":"+String(totalChunks)+"}";
+    mqtt_client.publish(mqtt_topic_complete, completeMsg.c_str(), true, 0);
+    mqtt_client.loop(); delay(500);
+    return true;
+}
+
+// ---------- 拍照與傳送 ----------
+bool captureAndSendPhoto() {
+    Serial.println("Taking photo...");
+    pinMode(FLASH_LED_PIN, OUTPUT); digitalWrite(FLASH_LED_PIN,HIGH); delay(80);
+    camera_fb_t* fb = esp_camera_fb_get();
+    digitalWrite(FLASH_LED_PIN,LOW);
+    if(!fb){ Serial.println("Camera failed"); return false; }
+
+    String imageId = String(millis());
+    String imageBase64 = base64::encode(fb->buf, fb->len);
+    String info = "{\"id\":\""+imageId+"\",\"timestamp\":"+String(millis())+
+                    ",\"original_size\":"+String(fb->len)+
+                    ",\"base64_size\":"+String(imageBase64.length())+
+                    ",\"format\":\"jpeg\",\"encoding\":\"base64\"}";
+    mqtt_client.publish(mqtt_topic_info, info.c_str(), true, 0);
+    mqtt_client.loop();
+    bool success = sendImageChunks(imageId,imageBase64);
+    esp_camera_fb_return(fb);
+    return success;
+}
+
+// ---------- Setup ----------
+void setup() {
+    Serial.begin(115200);
+    setupCamera();
+    lastPhotoTime = millis();
+    esp_sleep_enable_timer_wakeup(photoInterval*1000000ULL);
+    Serial.println("Setup complete. Entering light sleep.");
+    esp_light_sleep_start();
+}
+
+// ---------- Loop ----------
+void loop() {
+    Serial.println("\n--- Woke up ---");
+    unsigned long wakeTime = millis();
+
+    setupWiFi();
+    connectToMQTT();
+
+    if(WiFi.status()!=WL_CONNECTED || !mqtt_client.connected()){
+        Serial.println("Network failed. Skipping task.");
+    } else {
+        mqtt_client.publish(mqtt_status_topic,"ESP32-CAM Online",true,0);
+        waitingForOK=true; okWaitStart = millis();
+        // 非阻塞握手
+        while(waitingForOK && millis()-okWaitStart < okTimeout){
+            mqtt_client.loop(); delay(10);
+        }
+        if(waitingForOK) Serial.println("Handshake timeout. Skipping photo.");
+        else {
+            int retries=0; bool done=false;
+            while(!done && retries<maxPhotoRetries){
+                done=captureAndSendPhoto();
+                if(!done){ retries++; Serial.printf("Photo retry %d\n",retries);}
+            }
+        }
+    }
+
+    // 計算剩餘時間進入 light sleep
+    unsigned long elapsed = (millis()-wakeTime)/1000;
+    unsigned long sleepTime = (photoInterval>elapsed)?(photoInterval-elapsed):1;
+    Serial.printf("Sleeping %lu seconds...\n", sleepTime);
+    esp_sleep_enable_timer_wakeup(sleepTime*1000000ULL);
+    esp_light_sleep_start();
+}
